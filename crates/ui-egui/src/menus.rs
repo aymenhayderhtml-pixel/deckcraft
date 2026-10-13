@@ -262,6 +262,6 @@ pub fn menu_tree() -> Vec<(&'static str, Vec<(&'static str, &'static str)>)> {
                 ("Set Up Show…", "show.setup"),
             ],
         ),
-        ("Help", vec![("About DeckCraft", "app.about"), ("Command Palette", "app.palette")]),
+        ("Help", vec![("About DeckCraft", "app.about"), ("AI Agent Setup…", "app.agentSetup"), ("Command Palette", "app.palette")]),
     ]
 }

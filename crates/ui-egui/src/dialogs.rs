@@ -7,18 +7,20 @@ use serde_json::{Value, json};
 use crate::SlideApp;
 use crate::theme::{self, Tokens};
 
-#[derive(Clone, Debug, serde::Serialize)]
+#[derive(Debug, serde::Serialize)]
 pub struct Dialog {
     pub id: String,
     pub params: Value,
     /// Field values while the dialog is open.
     #[serde(skip)]
     pub fields: std::collections::HashMap<String, String>,
+    #[serde(skip)]
+    pub agent: Option<AgentSetupState>,
 }
 
 impl Dialog {
     pub fn new(id: &str) -> Self {
-        Dialog { id: id.into(), params: Value::Null, fields: Default::default() }
+        Dialog { id: id.into(), params: Value::Null, fields: Default::default(), agent: None }
     }
     pub fn modal(&self) -> bool {
         true
@@ -44,6 +46,7 @@ fn title(id: &str) -> &'static str {
         "renameLayout" => "Rename Layout",
         "paragraph" => "Paragraph",
         "about" => "About DeckCraft",
+        "agentSetup" => "AI Agent & MCP Setup",
         "preferences" => "Preferences",
         "export" => "Export",
         "symbol" => "Symbol",
@@ -708,6 +711,11 @@ fn body(app: &mut SlideApp, ui: &mut Ui, d: &mut Dialog) -> bool {
             let (ok, _) = buttons(ui, "Close");
             ok
         }
+        "agentSetup" => {
+            agent_setup_dialog(ui, d);
+            let (ok, _) = buttons(ui, "Close");
+            ok
+        }
         "preferences" => {
             ui.label(egui::RichText::new("General").font(theme::bold(13.0)));
             let mut dark = app.ui.brightness == theme::Brightness::Dark;
@@ -797,6 +805,163 @@ pub fn about(_app: &mut SlideApp, ui: &mut Ui) {
         ui.add_space(6.0);
         ui.label(egui::RichText::new("MIT OR Apache-2.0 · © 2026 ArtCraft Team and the DeckCraft contributors").size(11.0).color(t.text_faint));
     });
+}
+
+const DOWNLOAD_URL: &str = "https://github.com/storytold/deckcraft/releases";
+
+#[derive(Debug)]
+pub struct AgentSetupState {
+    os: crate::agent_setup::Os,
+    kind: crate::agent_setup::PackageKind,
+    exe: String,
+    default_launch: crate::agent_setup::CliLaunch,
+    cli_path: Option<String>,
+    version_res: Option<Result<String, String>>,
+    version_rx: Option<std::sync::mpsc::Receiver<Result<String, String>>>,
+}
+
+impl AgentSetupState {
+    fn new() -> Self {
+        let os = if cfg!(target_os = "windows") {
+            crate::agent_setup::Os::Windows
+        } else if cfg!(target_os = "macos") {
+            crate::agent_setup::Os::MacOs
+        } else {
+            crate::agent_setup::Os::Linux
+        };
+
+        let exe = std::env::current_exe().map(|p| p.to_string_lossy().into_owned()).unwrap_or_else(|_| "deckcraft".into());
+        let kind = crate::agent_setup::detect_package_kind(
+            std::env::var("APPIMAGE").ok().as_deref(),
+            std::env::var("FLATPAK_ID").ok().as_deref(),
+            std::path::Path::new("/.flatpak-info").exists(),
+        );
+        let default_launch = crate::agent_setup::cli_launch(os, kind, &exe);
+
+        let mut state = AgentSetupState { os, kind, exe, default_launch, cli_path: None, version_res: None, version_rx: None };
+        state.start_check();
+        state
+    }
+
+    fn start_check(&mut self) {
+        self.version_res = None;
+        if self.kind == crate::agent_setup::PackageKind::Flatpak {
+            self.cli_path = Some(self.default_launch.program.clone());
+        } else {
+            let candidates = crate::agent_setup::cli_candidates(self.os, self.kind, &self.exe, std::env::var("PATH").ok().as_deref());
+            self.cli_path = crate::agent_setup::first_existing(&candidates);
+        }
+
+        if let Some(ref path) = self.cli_path {
+            let launch = if self.kind == crate::agent_setup::PackageKind::Flatpak {
+                self.default_launch.clone()
+            } else {
+                crate::agent_setup::CliLaunch { program: path.clone(), args: Vec::new(), temporary: self.default_launch.temporary }
+            };
+            let (tx, rx) = std::sync::mpsc::channel();
+            self.version_rx = Some(rx);
+            let _ = std::thread::spawn(move || {
+                let res = crate::agent_setup::cli_version(&launch, std::time::Duration::from_secs(5));
+                let _ = tx.send(res);
+            });
+        } else {
+            self.version_rx = None;
+        }
+    }
+
+    fn poll(&mut self) -> bool {
+        if let Some(ref rx) = self.version_rx {
+            match rx.try_recv() {
+                Ok(res) => {
+                    self.version_res = Some(res);
+                    self.version_rx = None;
+                }
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    self.version_rx = None;
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => {}
+            }
+        }
+        self.version_rx.is_some()
+    }
+}
+
+pub fn agent_setup_dialog(ui: &mut Ui, d: &mut Dialog) {
+    let st = d.agent.get_or_insert_with(AgentSetupState::new);
+    let running = st.poll();
+    if running {
+        ui.ctx().request_repaint();
+    }
+
+    ui.set_min_width(520.0);
+    ui.label("Connect an AI agent to DeckCraft using the command line interface and Model Context Protocol (MCP).");
+    ui.add_space(8.0);
+
+    let t = Tokens::get(ui.ctx());
+
+    if running {
+        ui.label(egui::RichText::new("Checking…").color(t.text_dim));
+    } else {
+        match &st.cli_path {
+            None => {
+                ui.label("deckcraft-cli was not found on this computer.");
+                if st.os == crate::agent_setup::Os::MacOs {
+                    ui.label("On macOS the command line tool is a separate download.");
+                }
+                ui.hyperlink_to("Download deckcraft-cli", DOWNLOAD_URL);
+            }
+            Some(path) => {
+                ui.label(format!("CLI: {path}"));
+                match &st.version_res {
+                    Some(Ok(v)) => {
+                        ui.label(format!("Version: {v}"));
+                        ui.add_space(8.0);
+
+                        let launch_args =
+                            if st.kind == crate::agent_setup::PackageKind::Flatpak { st.default_launch.args.clone() } else { Vec::new() };
+                        let (cmd, json) = crate::agent_setup::setup_texts_for_program(st.os, path, launch_args, None);
+
+                        ui.label(egui::RichText::new("Claude CLI Registration Command:").strong());
+                        ui.add(egui::TextEdit::multiline(&mut cmd.as_str()).desired_rows(2).desired_width(f32::INFINITY));
+                        if ui.button("Copy command").clicked() {
+                            ui.ctx().copy_text(cmd);
+                        }
+
+                        ui.add_space(8.0);
+                        ui.label(egui::RichText::new("MCP Configuration JSON:").strong());
+                        ui.add(egui::TextEdit::multiline(&mut json.as_str()).desired_rows(6).desired_width(f32::INFINITY));
+                        if ui.button("Copy JSON").clicked() {
+                            ui.ctx().copy_text(json);
+                        }
+                    }
+                    Some(Err(e)) => {
+                        ui.label(egui::RichText::new(format!("Version check failed: {e}")).color(Color32::from_rgb(220, 50, 50)));
+                        if e == "not found" || e == "not executable" {
+                            ui.label("The file cannot be run. Reinstall deckcraft-cli or fix its permissions.");
+                        } else if e.starts_with("did not respond") {
+                            ui.label("The check timed out. Press Check again.");
+                        } else {
+                            ui.label("The command failed. Reinstall deckcraft-cli, or press Check again.");
+                        }
+                        ui.hyperlink_to("Download deckcraft-cli", DOWNLOAD_URL);
+                    }
+                    None => {}
+                }
+            }
+        }
+    }
+
+    ui.add_space(8.0);
+    ui.horizontal(|ui| {
+        if ui.button("Check again").clicked() {
+            st.start_check();
+        }
+    });
+
+    if st.default_launch.temporary {
+        ui.add_space(8.0);
+        ui.label(egui::RichText::new("Note: The path inside an AppImage mount is temporary and disappears when DeckCraft closes.").color(t.text_dim));
+    }
 }
 
 /// "Version X.Y.Z" plus, for release builds, the short commit and build date. The version comes

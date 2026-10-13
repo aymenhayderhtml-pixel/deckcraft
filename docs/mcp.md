@@ -13,6 +13,12 @@ deck.
 }
 ```
 
+## Set up from the desktop app
+
+Open the command palette (⇧⌘P), run `AI Agent Setup…`, and inspect the CLI path and version check.
+Then copy the ready Claude registration command or MCP configuration JSON.
+On macOS the command line tool is a separate download.
+
 ## Tools
 
 | Tool | What it does |
